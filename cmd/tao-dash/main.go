@@ -1,8 +1,12 @@
 package main
 
-import "fmt"
+import (
+	"Mogza/TaoDash/internal/ui"
+	"fmt"
+)
 
 func main() {
-	fmt.Println("TaoDash")
+	ui.LaunchApp()
+	fmt.Println("Exiting TaoDash...")
 	return
 }
