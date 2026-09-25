@@ -43,10 +43,10 @@ type SortOption struct {
 
 // SortOptions is the ordered list of available sorts, cycled with the [s] key.
 var SortOptions = []SortOption{
-	{"stake_desc", "STAKE ↓", 1},
-	{"emission_desc", "EMISSION ↓", 3},
-	{"trust_desc", "TRUST ↓", 2},
-	{"dividends_desc", "DIVIDND ↓", 4},
+	{"stake_desc", "STAKE ↓", 2},
+	{"emission_desc", "EMISSION ↓", 4},
+	{"trust_desc", "TRUST ↓", 3},
+	{"dividends_desc", "DIVIDND ↓", 5},
 	{"uid_asc", "UID ↑", 0},
 }
 

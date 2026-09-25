@@ -266,7 +266,7 @@ func (m Model) View() string {
 	headers := buildHeaders(m.sortIndex)
 	var table strings.Builder
 	fmt.Fprintf(&table, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(white).Render(headers))
-	table.WriteString(strings.Repeat("─", 76) + "\n")
+	table.WriteString(strings.Repeat("─", 87) + "\n")
 
 	displayCount := len(m.neurons)
 	if displayCount > maxRows {
@@ -290,8 +290,8 @@ func (m Model) View() string {
 			prefix = "▶"
 		}
 
-		row := fmt.Sprintf("%s%-4d │ %-14.2f │ %-8.4f │ %-10.4f │ %-8.4f │ %s",
-			prefix, n.UID, n.Stake, n.Trust, n.Emission, n.Dividends, permit)
+		row := fmt.Sprintf("%s%-4d │ %-8s │ %-14.2f │ %-8.4f │ %-10.4f │ %-8.4f │ %s",
+			prefix, n.UID, truncate(n.HotkeySS58, 8), n.Stake, n.Trust, n.Emission, n.Dividends, permit)
 
 		switch {
 		case m.cfg.MyHotkey != "" && n.HotkeySS58 == m.cfg.MyHotkey:
@@ -309,7 +309,7 @@ func (m Model) View() string {
 			"  ↕ %d/%d neurons (scroll with j/k)", m.cursor+1, len(m.neurons))) + "\n")
 	}
 
-	tablePane := paneStyle.Width(80).Height(20).Render(table.String())
+	tablePane := paneStyle.Width(90).Height(20).Render(table.String())
 
 	// ── Logs ─────────────────────────────────────────────────────────────────
 	var logs strings.Builder
@@ -317,7 +317,7 @@ func (m Model) View() string {
 	for _, l := range m.logs {
 		logs.WriteString(labelStyle.Render(l) + "\n")
 	}
-	logPane := paneStyle.Width(80).Height(6).Render(logs.String())
+	logPane := paneStyle.Width(90).Height(6).Render(logs.String())
 
 	// ── Footer ───────────────────────────────────────────────────────────────
 	sort := network.SortOptions[m.sortIndex].Label
@@ -355,14 +355,14 @@ func (m Model) fetchCmd(blockNumber int) tea.Cmd {
 
 // buildHeaders returns the formatted table header row with sort indicator on the active column.
 func buildHeaders(sortIndex int) string {
-	cols := []string{"UID", "STAKE (τ)", "TRUST", "EMISSION", "DIVIDND", "PERMIT"}
+	cols := []string{"UID", "HOTKEY", "STAKE (τ)", "TRUST", "EMISSION", "DIVIDND", "PERMIT"}
 	opt := network.SortOptions[sortIndex]
 	cols[opt.ColumnIndex] = lipgloss.NewStyle().
 		Foreground(taoNeon).Bold(true).
 		Render(cols[opt.ColumnIndex] + " " + arrow(opt.APIValue))
 
-	return fmt.Sprintf(" %-5s │ %-14s │ %-8s │ %-10s │ %-8s │ %s",
-		cols[0], cols[1], cols[2], cols[3], cols[4], cols[5])
+	return fmt.Sprintf(" %-5s │ %-8s │ %-14s │ %-8s │ %-10s │ %-8s │ %s",
+		cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6])
 }
 
 func arrow(apiValue string) string {
@@ -390,10 +390,10 @@ func truncate(s string, n int) string {
 
 func getMockNeurons() []types.Neuron {
 	return []types.Neuron{
-		{UID: 0, Stake: 154320.50, Trust: 0.9854, Emission: 12.45, Dividends: 0.2534, ValidatorPermit: true},
-		{UID: 14, Stake: 89040.20, Trust: 0.9120, Emission: 8.12, Dividends: 0.1832, ValidatorPermit: true},
-		{UID: 42, Stake: 45000.00, Trust: 0.8500, Emission: 4.05, Dividends: 0.0921, ValidatorPermit: true},
-		{UID: 128, Stake: 21000.75, Trust: 0.7200, Emission: 1.89, Dividends: 0.0412, ValidatorPermit: false},
-		{UID: 255, Stake: 5000.10, Trust: 0.4500, Emission: 0.20, Dividends: 0.0050, ValidatorPermit: false},
+		{UID: 0, HotkeySS58: "5F3sa2TJ", Stake: 154320.50, Trust: 0.9854, Emission: 12.45, Dividends: 0.2534, ValidatorPermit: true},
+		{UID: 14, HotkeySS58: "5DqrUa2z", Stake: 89040.20, Trust: 0.9120, Emission: 8.12, Dividends: 0.1832, ValidatorPermit: true},
+		{UID: 42, HotkeySS58: "5EKrpcqV", Stake: 45000.00, Trust: 0.8500, Emission: 4.05, Dividends: 0.0921, ValidatorPermit: true},
+		{UID: 128, HotkeySS58: "5FpsgU3J", Stake: 21000.75, Trust: 0.7200, Emission: 1.89, Dividends: 0.0412, ValidatorPermit: false},
+		{UID: 255, HotkeySS58: "5GgMeLFN", Stake: 5000.10, Trust: 0.4500, Emission: 0.20, Dividends: 0.0050, ValidatorPermit: false},
 	}
 }
