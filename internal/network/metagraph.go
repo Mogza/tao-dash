@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"Mogza/TaoDash/internal/cache"
 	"Mogza/TaoDash/internal/types"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,13 +19,11 @@ import (
 
 const (
 	taostatsBaseURL = "https://api.taostats.io/api"
-	defaultNetUID   = 1
-	defaultLimit    = 256  // Max neurons per page (API caps at 1024)
+	defaultLimit    = 256
 	requestTimeout  = 10 * time.Second
 )
 
 // --- Taostats API JSON shapes ---
-// These are internal to the network package. We parse them, then convert to our clean domain types.
 
 type apiKey struct {
 	Hex  string `json:"hex"`
@@ -31,27 +31,27 @@ type apiKey struct {
 }
 
 type apiNeuron struct {
-	UID             int    `json:"uid"`
-	Netuid          int    `json:"netuid"`
-	Active          bool   `json:"active"`
-	Stake           string `json:"stake"`
-	Trust           string `json:"trust"`
-	Consensus       string `json:"consensus"`
-	Incentive       string `json:"incentive"`
-	Dividends       string `json:"dividends"`
-	Emission        string `json:"emission"`
-	ValidatorPermit bool   `json:"validator_permit"`
-	ValidatorTrust  string `json:"validator_trust"`
-	Rank            int    `json:"rank"`
-	Hotkey          apiKey `json:"hotkey"`
-	Coldkey         apiKey `json:"coldkey"`
-	BlockNumber     int    `json:"block_number"`
-	DailyReward     string `json:"daily_reward"`
-	Updated         int    `json:"updated"`
-	IsImmunityPeriod bool  `json:"is_immunity_period"`
-	AlphaStake      string `json:"alpha_stake"`
-	RootStake       string `json:"root_stake"`
-	TotalAlphaStake string `json:"total_alpha_stake"`
+	UID              int    `json:"uid"`
+	Netuid           int    `json:"netuid"`
+	Active           bool   `json:"active"`
+	Stake            string `json:"stake"`
+	Trust            string `json:"trust"`
+	Consensus        string `json:"consensus"`
+	Incentive        string `json:"incentive"`
+	Dividends        string `json:"dividends"`
+	Emission         string `json:"emission"`
+	ValidatorPermit  bool   `json:"validator_permit"`
+	ValidatorTrust   string `json:"validator_trust"`
+	Rank             int    `json:"rank"`
+	Hotkey           apiKey `json:"hotkey"`
+	Coldkey          apiKey `json:"coldkey"`
+	BlockNumber      int    `json:"block_number"`
+	DailyReward      string `json:"daily_reward"`
+	Updated          int    `json:"updated"`
+	IsImmunityPeriod bool   `json:"is_immunity_period"`
+	AlphaStake       string `json:"alpha_stake"`
+	RootStake        string `json:"root_stake"`
+	TotalAlphaStake  string `json:"total_alpha_stake"`
 }
 
 type apiResponse struct {
@@ -69,35 +69,59 @@ type apiPagination struct {
 
 // --- Bubbletea Messages ---
 
-// MetagraphMsg carries the fetched metagraph data into the Bubbletea Update loop.
+// MetagraphMsg transporte les données du metagraph vers le Update() de l'UI.
 type MetagraphMsg struct {
-	Neurons []types.Neuron
-	NetUID  int
-	Block   int
+	Neurons   []types.Neuron
+	NetUID    int
+	Block     int
+	FromCache bool // true = servi depuis Redis, false = frais depuis l'API
 }
 
-// MetagraphErrMsg carries a network error into the UI for display in the log pane.
+// MetagraphErrMsg transporte une erreur réseau vers les logs de l'UI.
 type MetagraphErrMsg struct {
 	Err error
 }
 
-// --- The tea.Cmd factory ---
-// This is the public API. The UI calls FetchMetagraph() which returns a tea.Cmd.
-// The Cmd runs in a goroutine (managed by Bubbletea runtime), fetches data,
-// and returns a Msg that flows back into Update(). Zero channel plumbing needed.
+// --- Public API ---
 
-// FetchMetagraph returns a tea.Cmd that fetches the metagraph for the given subnet.
-// apiKey is the Taostats API key (passed as Authorization header, no "Bearer" prefix).
-func FetchMetagraph(apiKeyStr string, netUID int) tea.Cmd {
+// FetchMetagraph retourne un tea.Cmd qui :
+// 1. Vérifie le cache Redis si disponible (clé = netuid + blockNumber)
+// 2. En cas de miss, tape l'API Taostats
+// 3. Stocke le résultat dans Redis avec une TTL de sécurité
+//
+// blockNumber = 0 → skip le check cache, force un appel API (utile au démarrage)
+func FetchMetagraph(apiKeyStr string, netUID int, blockNumber int, c *cache.Client) tea.Cmd {
 	return func() tea.Msg {
+		ctx := context.Background()
+
+		// Cache check : seulement si on connaît le numéro de bloc courant
+		if c != nil && blockNumber > 0 {
+			if neurons, ok := c.GetMetagraph(ctx, netUID, blockNumber); ok {
+				return MetagraphMsg{
+					Neurons:   neurons,
+					NetUID:    netUID,
+					Block:     blockNumber,
+					FromCache: true,
+				}
+			}
+		}
+
+		// Cache miss ou pas de cache : appel API
 		neurons, block, err := fetchMetagraphFromAPI(apiKeyStr, netUID)
 		if err != nil {
 			return MetagraphErrMsg{Err: err}
 		}
+
+		// Stockage dans Redis (keyed par le bloc retourné par l'API, pas par blockNumber)
+		if c != nil {
+			_ = c.SetMetagraph(ctx, netUID, block, neurons)
+		}
+
 		return MetagraphMsg{
-			Neurons: neurons,
-			NetUID:  netUID,
-			Block:   block,
+			Neurons:   neurons,
+			NetUID:    netUID,
+			Block:     block,
+			FromCache: false,
 		}
 	}
 }
@@ -170,7 +194,7 @@ func fetchMetagraphFromAPI(apiKeyStr string, netUID int) ([]types.Neuron, int, e
 	return neurons, block, nil
 }
 
-// raoToTao converts a RAO string (integer, 1 TAO = 1e9 RAO) to TAO float64.
+// raoToTao convertit un RAO string (1 TAO = 1e9 RAO) en TAO float64.
 func raoToTao(rao string) float64 {
 	val, err := strconv.ParseFloat(rao, 64)
 	if err != nil {
@@ -179,7 +203,7 @@ func raoToTao(rao string) float64 {
 	return val / 1e9
 }
 
-// parseFloat safely parses a string float, returning 0 on failure.
+// parseFloat parse un string float, retourne 0 en cas d'erreur.
 func parseFloat(s string) float64 {
 	val, err := strconv.ParseFloat(s, 64)
 	if err != nil {

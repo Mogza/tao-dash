@@ -10,22 +10,34 @@ import (
 type Config struct {
 	TaostatsAPIKey string
 	DefaultNetUID  int
+	RedisURL       string
+	SubstrateWSURL string
 }
 
-// Load reads configuration from a .env file (if present) then from environment variables.
-// Environment variables set in the shell take precedence over the .env file.
-// TAOSTATS_API_KEY is required for live metagraph data.
+// Load lit la config depuis le .env (si présent) puis les variables d'environnement.
+// Les variables shell ont priorité sur le .env.
 func Load() Config {
-	// Silently ignore if .env is absent — not an error in production.
 	_ = godotenv.Load()
+
+	substrateURL := os.Getenv("SUBSTRATE_WS_URL")
+	if substrateURL == "" {
+		substrateURL = "wss://entrypoint-finney.opentensor.ai"
+	}
 
 	return Config{
 		TaostatsAPIKey: os.Getenv("TAOSTATS_API_KEY"),
 		DefaultNetUID:  1,
+		RedisURL:       os.Getenv("REDIS_URL"),
+		SubstrateWSURL: substrateURL,
 	}
 }
 
-// HasAPIKey returns true if a Taostats API key is configured.
+// HasAPIKey retourne true si une clé Taostats est configurée.
 func (c Config) HasAPIKey() bool {
 	return c.TaostatsAPIKey != ""
+}
+
+// HasRedis retourne true si une URL Redis est configurée.
+func (c Config) HasRedis() bool {
+	return c.RedisURL != ""
 }

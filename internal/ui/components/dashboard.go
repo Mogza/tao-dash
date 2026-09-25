@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"Mogza/TaoDash/internal/cache"
 	"Mogza/TaoDash/internal/config"
 	"Mogza/TaoDash/internal/network"
 	"Mogza/TaoDash/internal/types"
@@ -12,18 +13,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
-
-// --- Auto-refresh tick ---
-
-const refreshInterval = 30 * time.Second
-
-type tickMsg time.Time
-
-func tickCmd() tea.Cmd {
-	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
-}
 
 // --- DESIGN SYSTEM ---
 var (
@@ -33,13 +22,9 @@ var (
 	grayLight = lipgloss.Color("#888888")
 	redAlert  = lipgloss.Color("#FF3366")
 	yellow    = lipgloss.Color("#FFD700")
+	cyan      = lipgloss.Color("#00CFFF")
 
-	titleStyle = lipgloss.NewStyle().
-			Foreground(grayDark).
-			Background(taoNeon).
-			Bold(true).
-			Padding(0, 2)
-
+	titleStyle  = lipgloss.NewStyle().Foreground(grayDark).Background(taoNeon).Bold(true).Padding(0, 2)
 	metricStyle = lipgloss.NewStyle().Foreground(white).Bold(true)
 	labelStyle  = lipgloss.NewStyle().Foreground(grayLight)
 	warnStyle   = lipgloss.NewStyle().Foreground(yellow).Bold(true)
@@ -56,49 +41,70 @@ var (
 // --- Model ---
 
 type Model struct {
-	neurons  []types.Neuron
-	cursor   int
-	block    int
-	taoPrice float64
-	logs     []string
-	cfg      config.Config
-	loading  bool
-	netUID   int
+	neurons      []types.Neuron
+	cursor       int
+	block        int
+	logs         []string
+	cfg          config.Config
+	loading      bool
+	netUID       int
+	blockSub     network.BlockSub  // channel partagé avec la goroutine WebSocket
+	redisClient  *cache.Client     // nil si Redis absent
+	lastCached   bool              // true si le dernier fetch vient du cache
 }
 
 func InitialModel() Model {
 	cfg := config.Load()
+
+	// Connexion Redis optionnelle : dégradation gracieuse si absent ou mal configuré
+	var redisClient *cache.Client
+	if cfg.HasRedis() {
+		var err error
+		redisClient, err = cache.New(cfg.RedisURL)
+		if err != nil {
+			// On loggue l'erreur plus bas dans Init() — pas de panic
+			redisClient = nil
+		}
+	}
+
 	return Model{
-		neurons:  nil,
-		cursor:   0,
-		block:    0,
-		taoPrice: 0,
-		logs: []string{
-			fmt.Sprintf("[%s] TAO-DASH initialized.", time.Now().Format("15:04:05")),
-		},
-		cfg:     cfg,
-		loading: true,
-		netUID:  cfg.DefaultNetUID,
+		neurons:     nil,
+		cursor:      0,
+		block:       0,
+		logs:        []string{fmt.Sprintf("[%s] TAO-DASH initialized.", time.Now().Format("15:04:05"))},
+		cfg:         cfg,
+		loading:     true,
+		netUID:      cfg.DefaultNetUID,
+		blockSub:    network.NewBlockSub(),
+		redisClient: redisClient,
 	}
 }
 
-// Init fires the first metagraph fetch + starts the auto-refresh timer.
+// Init démarre le block watcher WebSocket et lance le premier fetch metagraph.
 func (m Model) Init() tea.Cmd {
-	if !m.cfg.HasAPIKey() {
-		// No API key — we'll show mock data, logged in Update via a nil MetagraphMsg
-		return tea.Batch(
-			func() tea.Msg {
-				return network.MetagraphErrMsg{Err: fmt.Errorf("TAOSTATS_API_KEY not set — using mock data. Export it to go live")}
-			},
-			tickCmd(),
-		)
+	cmds := []tea.Cmd{}
+
+	// Redis status log
+	if m.cfg.HasRedis() && m.redisClient != nil {
+		m.logs = append(m.logs, fmt.Sprintf("[%s] Redis connected (%s).", time.Now().Format("15:04:05"), m.cfg.RedisURL))
+	} else if m.cfg.HasRedis() && m.redisClient == nil {
+		m.logs = append(m.logs, fmt.Sprintf("[%s] WARN: Redis unreachable, running without cache.", time.Now().Format("15:04:05")))
 	}
 
-	m.logs = append(m.logs, fmt.Sprintf("[%s] Fetching Subnet %d metagraph...", time.Now().Format("15:04:05"), m.netUID))
-	return tea.Batch(
-		network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID),
-		tickCmd(),
-	)
+	// Démarrage du block watcher (goroutine long-lived, reconnexion automatique)
+	network.StartBlockWatcher(m.cfg.SubstrateWSURL, m.blockSub)
+	cmds = append(cmds, network.WaitForBlock(m.blockSub))
+
+	// Premier fetch metagraph (blockNumber=0 → force API, pas de cache check)
+	if m.cfg.HasAPIKey() {
+		cmds = append(cmds, network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID, 0, m.redisClient))
+	} else {
+		cmds = append(cmds, func() tea.Msg {
+			return network.MetagraphErrMsg{Err: fmt.Errorf("TAOSTATS_API_KEY non définie — mode mock actif")}
+		})
+	}
+
+	return tea.Batch(cmds...)
 }
 
 // --- Update ---
@@ -119,41 +125,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			}
 		case "r":
-			// Manual refresh
 			if m.cfg.HasAPIKey() {
 				m.loading = true
-				m.addLog("Manual refresh triggered.")
-				return m, network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID)
+				m.addLog("Refresh manuel déclenché.")
+				// blockNumber=0 → force un appel API, ignore le cache
+				return m, network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID, 0, m.redisClient)
 			}
-			m.addLog("Cannot refresh: no API key set.")
+			m.addLog("Refresh impossible : TAOSTATS_API_KEY non définie.")
 		}
 
+	// Nouveau bloc Substrate reçu via WebSocket
+	case network.NewBlockMsg:
+		m.block = msg.Number
+		m.loading = true
+		m.addLog(fmt.Sprintf("Bloc #%d détecté.", msg.Number))
+		return m, tea.Batch(
+			network.WaitForBlock(m.blockSub), // re-queue pour continuer à écouter
+			network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID, msg.Number, m.redisClient),
+		)
+
+	// Erreur du block watcher (affichée dans les logs, pas de crash)
+	case network.BlockWatchErrMsg:
+		m.addLog(fmt.Sprintf("WS ERR: %s", msg.Err.Error()))
+		return m, network.WaitForBlock(m.blockSub) // toujours re-queue pour la reconnexion
+
+	// Données metagraph reçues
 	case network.MetagraphMsg:
 		m.loading = false
 		m.neurons = msg.Neurons
 		m.block = msg.Block
-		m.addLog(fmt.Sprintf("Synced %d neurons @ block %d (Subnet %d).",
-			len(msg.Neurons), msg.Block, msg.NetUID))
+		m.lastCached = msg.FromCache
+		source := "API"
+		if msg.FromCache {
+			source = "CACHE"
+		}
+		m.addLog(fmt.Sprintf("[%s] %d neurons @ bloc %d (Subnet %d).", source, len(msg.Neurons), msg.Block, msg.NetUID))
 
+	// Erreur API metagraph
 	case network.MetagraphErrMsg:
 		m.loading = false
 		m.addLog(fmt.Sprintf("ERR: %s", msg.Err.Error()))
-		// If no neurons loaded yet, fall back to mock data
 		if len(m.neurons) == 0 {
 			m.neurons = getMockNeurons()
 			m.block = 0
 		}
-
-	case tickMsg:
-		// Auto-refresh on tick
-		if m.cfg.HasAPIKey() {
-			m.loading = true
-			return m, tea.Batch(
-				network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID),
-				tickCmd(),
-			)
-		}
-		return m, tickCmd()
 	}
 
 	return m, nil
@@ -170,12 +185,21 @@ func (m Model) View() string {
 	}
 	blockInfo := fmt.Sprintf("%s %s", labelStyle.Render("BLOCK:"), metricStyle.Render(blockStr))
 
+	// Indicateur de statut
 	statusStr := lipgloss.NewStyle().Foreground(taoNeon).Render("● LIVE")
 	if m.loading {
 		statusStr = lipgloss.NewStyle().Foreground(yellow).Render("◌ SYNCING")
+	} else if m.lastCached {
+		statusStr = lipgloss.NewStyle().Foreground(cyan).Render("◈ CACHED")
 	}
 	if !m.cfg.HasAPIKey() {
 		statusStr = lipgloss.NewStyle().Foreground(redAlert).Render("● MOCK")
+	}
+
+	// Indicateur Redis
+	cacheStr := lipgloss.NewStyle().Foreground(redAlert).Render("CACHE: OFF")
+	if m.redisClient != nil {
+		cacheStr = lipgloss.NewStyle().Foreground(taoNeon).Render("CACHE: ON")
 	}
 
 	neuronCount := fmt.Sprintf("%s %s",
@@ -183,7 +207,9 @@ func (m Model) View() string {
 		metricStyle.Render(fmt.Sprintf("%d", len(m.neurons))),
 	)
 
-	headerInfo := lipgloss.JoinHorizontal(lipgloss.Center, blockInfo, "   |   ", neuronCount, "   |   ", statusStr)
+	headerInfo := lipgloss.JoinHorizontal(lipgloss.Center,
+		blockInfo, "   |   ", neuronCount, "   |   ", statusStr, "   |   ", cacheStr,
+	)
 	header := lipgloss.JoinHorizontal(lipgloss.Bottom, title, "    ", headerInfo)
 
 	// Table
@@ -193,13 +219,11 @@ func (m Model) View() string {
 	fmt.Fprintf(&table, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(white).Render(headerRow))
 	table.WriteString(strings.Repeat("─", 72) + "\n")
 
-	// Show at most 15 rows to fit the terminal
 	displayCount := len(m.neurons)
 	if displayCount > 15 {
 		displayCount = 15
 	}
 
-	// Viewport offset for scrolling
 	offset := 0
 	if m.cursor >= displayCount {
 		offset = m.cursor - displayCount + 1
@@ -222,8 +246,8 @@ func (m Model) View() string {
 	}
 
 	if len(m.neurons) > displayCount {
-		scrollInfo := labelStyle.Render(fmt.Sprintf("  ↕ %d/%d neurons (scroll with j/k)", m.cursor+1, len(m.neurons)))
-		table.WriteString(scrollInfo + "\n")
+		table.WriteString(labelStyle.Render(fmt.Sprintf(
+			"  ↕ %d/%d neurons (scroll with j/k)", m.cursor+1, len(m.neurons))) + "\n")
 	}
 
 	tablePane := paneStyle.Width(76).Height(20).Render(table.String())
@@ -237,13 +261,12 @@ func (m Model) View() string {
 	logPane := paneStyle.Width(76).Height(6).Render(logs.String())
 
 	// Footer
-	footer := labelStyle.Render("\n  [↑/k]: Up  [↓/j]: Down  [r]: Refresh  [q]: Quit")
+	footer := labelStyle.Render("\n  [↑/k]: Up  [↓/j]: Down  [r]: Force Refresh  [q]: Quit")
 	if !m.cfg.HasAPIKey() {
 		footer += "\n" + warnStyle.Render("  ⚠  export TAOSTATS_API_KEY=<your_key> to enable live data")
 	}
 
 	ui := lipgloss.JoinVertical(lipgloss.Left, header, "\n", tablePane, logPane, footer)
-
 	return lipgloss.NewStyle().Margin(1, 2).Render(ui)
 }
 
@@ -257,7 +280,6 @@ func (m *Model) addLog(msg string) {
 	}
 }
 
-// getMockNeurons returns fallback data when no API key is available.
 func getMockNeurons() []types.Neuron {
 	return []types.Neuron{
 		{UID: 0, Stake: 154320.50, Trust: 0.9854, Emission: 12.45, Dividends: 0.2534, ValidatorPermit: true},
