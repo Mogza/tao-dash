@@ -12,6 +12,7 @@ type Config struct {
 	DefaultNetUID  int
 	RedisURL       string
 	SubstrateWSURL string
+	MyHotkey       string // SS58 address of the operator's own hotkey, highlighted in the table
 }
 
 // Load lit la config depuis le .env (si présent) puis les variables d'environnement.
@@ -29,6 +30,7 @@ func Load() Config {
 		DefaultNetUID:  1,
 		RedisURL:       os.Getenv("REDIS_URL"),
 		SubstrateWSURL: substrateURL,
+		MyHotkey:       os.Getenv("MY_HOTKEY"),
 	}
 }
 

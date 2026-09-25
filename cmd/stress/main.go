@@ -105,8 +105,11 @@ func scenario1(apiHits *atomic.Int64, c *cache.Client) {
 		go func(idx int) {
 			defer wg.Done()
 			t0 := time.Now()
-			cmd := network.FetchMetagraph("mock-key", testNetUID, testBlockNumber, c)
-			cmd() // execute the tea.Cmd directly (without Bubbletea runtime)
+			cmd := network.FetchMetagraph("mock-key", network.FetchOptions{
+				NetUID: testNetUID, BlockNumber: testBlockNumber,
+				SortOrder: "stake_desc", ValidatorsOnly: false,
+			}, c)
+			cmd()
 			latencies[idx] = time.Since(t0)
 		}(i)
 		if i%10 == 9 {
@@ -181,7 +184,10 @@ func scenario2(apiHits *atomic.Int64, c *cache.Client) {
 			go func(idx int) {
 				defer wg.Done()
 				t0 := time.Now()
-				cmd := network.FetchMetagraph("mock-key", testNetUID, blockNum, c)
+				cmd := network.FetchMetagraph("mock-key", network.FetchOptions{
+					NetUID: testNetUID, BlockNumber: blockNum,
+					SortOrder: "stake_desc", ValidatorsOnly: false,
+				}, c)
 				cmd()
 				latencies[idx] = time.Since(t0)
 			}(i)
@@ -350,7 +356,11 @@ func buildMockAPIResponse() map[string]any {
 func flushTestKeys(c *cache.Client) {
 	ctx := context.Background()
 	for i := 0; i <= multiBlockCount+1; i++ {
-		_ = c.Delete(ctx, testNetUID, testBlockNumber+i)
+		key := network.CacheKey(network.FetchOptions{
+			NetUID: testNetUID, BlockNumber: testBlockNumber + i,
+			SortOrder: "stake_desc", ValidatorsOnly: false,
+		})
+		_ = c.Del(ctx, key)
 	}
 }
 

@@ -14,7 +14,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// --- DESIGN SYSTEM ---
+// --- Design system ---
+
 var (
 	taoNeon   = lipgloss.Color("#00FFAA")
 	white     = lipgloss.Color("#FFFFFF")
@@ -23,6 +24,7 @@ var (
 	redAlert  = lipgloss.Color("#FF3366")
 	yellow    = lipgloss.Color("#FFD700")
 	cyan      = lipgloss.Color("#00CFFF")
+	amber     = lipgloss.Color("#FFA500")
 
 	titleStyle  = lipgloss.NewStyle().Foreground(grayDark).Background(taoNeon).Bold(true).Padding(0, 2)
 	metricStyle = lipgloss.NewStyle().Foreground(white).Bold(true)
@@ -36,73 +38,76 @@ var (
 
 	rowStyle         = lipgloss.NewStyle().Foreground(grayLight)
 	selectedRowStyle = lipgloss.NewStyle().Foreground(taoNeon).Bold(true).Background(grayDark)
+	// ownKeyStyle highlights the operator's own hotkey row — amber/gold, distinct from green selection
+	ownKeyStyle = lipgloss.NewStyle().Foreground(amber).Bold(true).Background(lipgloss.Color("#1a0f00"))
 )
 
 // --- Model ---
 
+const (
+	minNetUID = 1
+	maxNetUID = 64
+	maxRows   = 15
+)
+
 type Model struct {
-	neurons      []types.Neuron
-	cursor       int
-	block        int
-	logs         []string
-	cfg          config.Config
-	loading      bool
-	netUID       int
-	blockSub     network.BlockSub  // channel partagé avec la goroutine WebSocket
-	redisClient  *cache.Client     // nil si Redis absent
-	lastCached   bool              // true si le dernier fetch vient du cache
+	neurons        []types.Neuron
+	cursor         int
+	block          int
+	logs           []string
+	cfg            config.Config
+	loading        bool
+	netUID         int
+	sortIndex      int  // index into network.SortOptions
+	validatorsOnly bool // filter: show only neurons with validator_permit=true
+	blockSub       network.BlockSub
+	redisClient    *cache.Client
+	lastCached     bool
 }
 
 func InitialModel() Model {
 	cfg := config.Load()
 
-	// Connexion Redis optionnelle : dégradation gracieuse si absent ou mal configuré
 	var redisClient *cache.Client
 	if cfg.HasRedis() {
 		var err error
 		redisClient, err = cache.New(cfg.RedisURL)
 		if err != nil {
-			// On loggue l'erreur plus bas dans Init() — pas de panic
 			redisClient = nil
 		}
 	}
 
 	return Model{
-		neurons:     nil,
-		cursor:      0,
-		block:       0,
-		logs:        []string{fmt.Sprintf("[%s] TAO-DASH initialized.", time.Now().Format("15:04:05"))},
-		cfg:         cfg,
-		loading:     true,
-		netUID:      cfg.DefaultNetUID,
-		blockSub:    network.NewBlockSub(),
-		redisClient: redisClient,
+		neurons:        nil,
+		cursor:         0,
+		block:          0,
+		logs:           []string{fmt.Sprintf("[%s] TAO-DASH initialized.", ts())},
+		cfg:            cfg,
+		loading:        true,
+		netUID:         cfg.DefaultNetUID,
+		sortIndex:      0, // default: stake_desc
+		validatorsOnly: false,
+		blockSub:       network.NewBlockSub(),
+		redisClient:    redisClient,
 	}
 }
 
-// Init démarre le block watcher WebSocket et lance le premier fetch metagraph.
+// Init starts the WebSocket block watcher and fires the first metagraph fetch.
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{}
 
-	// Redis status log
 	if m.cfg.HasRedis() && m.redisClient != nil {
-		m.logs = append(m.logs, fmt.Sprintf("[%s] Redis connected (%s).", time.Now().Format("15:04:05"), m.cfg.RedisURL))
-	} else if m.cfg.HasRedis() && m.redisClient == nil {
-		m.logs = append(m.logs, fmt.Sprintf("[%s] WARN: Redis unreachable, running without cache.", time.Now().Format("15:04:05")))
+		m.logs = append(m.logs, fmt.Sprintf("[%s] Redis connected (%s).", ts(), m.cfg.RedisURL))
+	} else if m.cfg.HasRedis() {
+		m.logs = append(m.logs, fmt.Sprintf("[%s] WARN: Redis unreachable, running without cache.", ts()))
+	}
+	if m.cfg.MyHotkey != "" {
+		m.logs = append(m.logs, fmt.Sprintf("[%s] Tracking hotkey: %s", ts(), truncate(m.cfg.MyHotkey, 16)))
 	}
 
-	// Démarrage du block watcher (goroutine long-lived, reconnexion automatique)
 	network.StartBlockWatcher(m.cfg.SubstrateWSURL, m.blockSub)
 	cmds = append(cmds, network.WaitForBlock(m.blockSub))
-
-	// Premier fetch metagraph (blockNumber=0 → force API, pas de cache check)
-	if m.cfg.HasAPIKey() {
-		cmds = append(cmds, network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID, 0, m.redisClient))
-	} else {
-		cmds = append(cmds, func() tea.Msg {
-			return network.MetagraphErrMsg{Err: fmt.Errorf("TAOSTATS_API_KEY non définie — mode mock actif")}
-		})
-	}
+	cmds = append(cmds, m.fetchCmd(0))
 
 	return tea.Batch(cmds...)
 }
@@ -114,42 +119,85 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		switch msg.String() {
+
 		case "ctrl+c", "q":
 			return m, tea.Quit
+
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
 			}
+
 		case "down", "j":
 			if m.cursor < len(m.neurons)-1 {
 				m.cursor++
 			}
+
+		// Subnet navigation
+		case "[", "left":
+			if m.netUID > minNetUID {
+				m.netUID--
+				m.cursor = 0
+				m.loading = true
+				m.addLog(fmt.Sprintf("Switching to Subnet %d...", m.netUID))
+				return m, m.fetchCmd(0)
+			}
+
+		case "]", "right":
+			if m.netUID < maxNetUID {
+				m.netUID++
+				m.cursor = 0
+				m.loading = true
+				m.addLog(fmt.Sprintf("Switching to Subnet %d...", m.netUID))
+				return m, m.fetchCmd(0)
+			}
+
+		// Cycle sort order
+		case "s":
+			m.sortIndex = (m.sortIndex + 1) % len(network.SortOptions)
+			m.loading = true
+			m.cursor = 0
+			m.addLog(fmt.Sprintf("Sort: %s", network.SortOptions[m.sortIndex].Label))
+			return m, m.fetchCmd(0)
+
+		// Toggle validator filter
+		case "v":
+			m.validatorsOnly = !m.validatorsOnly
+			m.loading = true
+			m.cursor = 0
+			filter := "ALL"
+			if m.validatorsOnly {
+				filter = "VALIDATORS"
+			}
+			m.addLog(fmt.Sprintf("Filter: %s", filter))
+			return m, m.fetchCmd(0)
+
+		// Force refresh (bypasses cache)
 		case "r":
 			if m.cfg.HasAPIKey() {
 				m.loading = true
-				m.addLog("Refresh manuel déclenché.")
-				// blockNumber=0 → force un appel API, ignore le cache
-				return m, network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID, 0, m.redisClient)
+				m.addLog("Manual refresh.")
+				return m, m.fetchCmd(0)
 			}
-			m.addLog("Refresh impossible : TAOSTATS_API_KEY non définie.")
+			m.addLog("Refresh unavailable: TAOSTATS_API_KEY not set.")
 		}
 
-	// Nouveau bloc Substrate reçu via WebSocket
+	// New Substrate block received via WebSocket
 	case network.NewBlockMsg:
 		m.block = msg.Number
 		m.loading = true
-		m.addLog(fmt.Sprintf("Bloc #%d détecté.", msg.Number))
+		m.addLog(fmt.Sprintf("Block #%d detected.", msg.Number))
 		return m, tea.Batch(
-			network.WaitForBlock(m.blockSub), // re-queue pour continuer à écouter
-			network.FetchMetagraph(m.cfg.TaostatsAPIKey, m.netUID, msg.Number, m.redisClient),
+			network.WaitForBlock(m.blockSub), // re-queue to keep listening
+			m.fetchCmd(msg.Number),           // fetch with block hint for cache lookup
 		)
 
-	// Erreur du block watcher (affichée dans les logs, pas de crash)
+	// Block watcher error (logged, no crash)
 	case network.BlockWatchErrMsg:
 		m.addLog(fmt.Sprintf("WS ERR: %s", msg.Err.Error()))
-		return m, network.WaitForBlock(m.blockSub) // toujours re-queue pour la reconnexion
+		return m, network.WaitForBlock(m.blockSub)
 
-	// Données metagraph reçues
+	// Metagraph data received
 	case network.MetagraphMsg:
 		m.loading = false
 		m.neurons = msg.Neurons
@@ -159,15 +207,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.FromCache {
 			source = "CACHE"
 		}
-		m.addLog(fmt.Sprintf("[%s] %d neurons @ bloc %d (Subnet %d).", source, len(msg.Neurons), msg.Block, msg.NetUID))
+		m.addLog(fmt.Sprintf("[%s] %d neurons @ block %d (Subnet %d).",
+			source, len(msg.Neurons), msg.Block, msg.NetUID))
 
-	// Erreur API metagraph
+	// Network error
 	case network.MetagraphErrMsg:
 		m.loading = false
 		m.addLog(fmt.Sprintf("ERR: %s", msg.Err.Error()))
 		if len(m.neurons) == 0 {
 			m.neurons = getMockNeurons()
-			m.block = 0
 		}
 	}
 
@@ -177,7 +225,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // --- View ---
 
 func (m Model) View() string {
-	title := titleStyle.Render(fmt.Sprintf(" TAO-DASH // SUBNET %d ", m.netUID))
+	// ── Header ──────────────────────────────────────────────────────────────
+	title := titleStyle.Render(fmt.Sprintf(" TAO-DASH // SUBNET [%d] ", m.netUID))
 
 	blockStr := "—"
 	if m.block > 0 {
@@ -185,7 +234,6 @@ func (m Model) View() string {
 	}
 	blockInfo := fmt.Sprintf("%s %s", labelStyle.Render("BLOCK:"), metricStyle.Render(blockStr))
 
-	// Indicateur de statut
 	statusStr := lipgloss.NewStyle().Foreground(taoNeon).Render("● LIVE")
 	if m.loading {
 		statusStr = lipgloss.NewStyle().Foreground(yellow).Render("◌ SYNCING")
@@ -196,32 +244,33 @@ func (m Model) View() string {
 		statusStr = lipgloss.NewStyle().Foreground(redAlert).Render("● MOCK")
 	}
 
-	// Indicateur Redis
 	cacheStr := lipgloss.NewStyle().Foreground(redAlert).Render("CACHE: OFF")
 	if m.redisClient != nil {
 		cacheStr = lipgloss.NewStyle().Foreground(taoNeon).Render("CACHE: ON")
 	}
 
 	neuronCount := fmt.Sprintf("%s %s",
-		labelStyle.Render("NEURONS:"),
-		metricStyle.Render(fmt.Sprintf("%d", len(m.neurons))),
-	)
+		labelStyle.Render("NEURONS:"), metricStyle.Render(fmt.Sprintf("%d", len(m.neurons))))
+
+	filterStr := labelStyle.Render("ALL")
+	if m.validatorsOnly {
+		filterStr = lipgloss.NewStyle().Foreground(cyan).Render("VALIDATORS")
+	}
 
 	headerInfo := lipgloss.JoinHorizontal(lipgloss.Center,
-		blockInfo, "   |   ", neuronCount, "   |   ", statusStr, "   |   ", cacheStr,
+		blockInfo, "   |   ", neuronCount, "   |   ", statusStr, "   |   ", cacheStr, "   |   ", filterStr,
 	)
 	header := lipgloss.JoinHorizontal(lipgloss.Bottom, title, "    ", headerInfo)
 
-	// Table
+	// ── Table ────────────────────────────────────────────────────────────────
+	headers := buildHeaders(m.sortIndex)
 	var table strings.Builder
-	headerRow := fmt.Sprintf(" %-5s │ %-14s │ %-8s │ %-10s │ %-8s │ %s",
-		"UID", "STAKE (τ)", "TRUST", "EMISSION", "DIVIDND", "PERMIT")
-	fmt.Fprintf(&table, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(white).Render(headerRow))
-	table.WriteString(strings.Repeat("─", 72) + "\n")
+	fmt.Fprintf(&table, "%s\n", lipgloss.NewStyle().Bold(true).Foreground(white).Render(headers))
+	table.WriteString(strings.Repeat("─", 76) + "\n")
 
 	displayCount := len(m.neurons)
-	if displayCount > 15 {
-		displayCount = 15
+	if displayCount > maxRows {
+		displayCount = maxRows
 	}
 
 	offset := 0
@@ -235,12 +284,22 @@ func (m Model) View() string {
 		if n.ValidatorPermit {
 			permit = "✓"
 		}
-		row := fmt.Sprintf(" %-5d │ %-14.2f │ %-8.4f │ %-10.4f │ %-8.4f │ %s",
-			n.UID, n.Stake, n.Trust, n.Emission, n.Dividends, permit)
 
+		prefix := " "
 		if m.cursor == i {
+			prefix = "▶"
+		}
+
+		row := fmt.Sprintf("%s%-4d │ %-14.2f │ %-8.4f │ %-10.4f │ %-8.4f │ %s",
+			prefix, n.UID, n.Stake, n.Trust, n.Emission, n.Dividends, permit)
+
+		switch {
+		case m.cfg.MyHotkey != "" && n.HotkeySS58 == m.cfg.MyHotkey:
+			// Own node — amber highlight, takes priority over cursor
+			table.WriteString(ownKeyStyle.Render(row+"  ★") + "\n")
+		case m.cursor == i:
 			table.WriteString(selectedRowStyle.Render(row) + "\n")
-		} else {
+		default:
 			table.WriteString(rowStyle.Render(row) + "\n")
 		}
 	}
@@ -250,18 +309,22 @@ func (m Model) View() string {
 			"  ↕ %d/%d neurons (scroll with j/k)", m.cursor+1, len(m.neurons))) + "\n")
 	}
 
-	tablePane := paneStyle.Width(76).Height(20).Render(table.String())
+	tablePane := paneStyle.Width(80).Height(20).Render(table.String())
 
-	// Logs
+	// ── Logs ─────────────────────────────────────────────────────────────────
 	var logs strings.Builder
 	logs.WriteString(lipgloss.NewStyle().Bold(true).Foreground(taoNeon).Render("LIVE LOGS:") + "\n")
 	for _, l := range m.logs {
 		logs.WriteString(labelStyle.Render(l) + "\n")
 	}
-	logPane := paneStyle.Width(76).Height(6).Render(logs.String())
+	logPane := paneStyle.Width(80).Height(6).Render(logs.String())
 
-	// Footer
-	footer := labelStyle.Render("\n  [↑/k]: Up  [↓/j]: Down  [r]: Force Refresh  [q]: Quit")
+	// ── Footer ───────────────────────────────────────────────────────────────
+	sort := network.SortOptions[m.sortIndex].Label
+	footer := labelStyle.Render(fmt.Sprintf(
+		"\n  [←/→]: Subnet   [s]: Sort (%s)   [v]: Filter   [↑/k][↓/j]: Scroll   [r]: Refresh   [q]: Quit",
+		sort,
+	))
 	if !m.cfg.HasAPIKey() {
 		footer += "\n" + warnStyle.Render("  ⚠  export TAOSTATS_API_KEY=<your_key> to enable live data")
 	}
@@ -272,12 +335,57 @@ func (m Model) View() string {
 
 // --- Helpers ---
 
+// fetchCmd builds a FetchMetagraph tea.Cmd from current model state.
+// blockNumber = 0 forces an API call (skips cache) — used on subnet switch, sort change, etc.
+func (m Model) fetchCmd(blockNumber int) tea.Cmd {
+	if !m.cfg.HasAPIKey() {
+		return func() tea.Msg {
+			return network.MetagraphErrMsg{
+				Err: fmt.Errorf("TAOSTATS_API_KEY not set — mock mode active"),
+			}
+		}
+	}
+	return network.FetchMetagraph(m.cfg.TaostatsAPIKey, network.FetchOptions{
+		NetUID:         m.netUID,
+		BlockNumber:    blockNumber,
+		SortOrder:      network.SortOptions[m.sortIndex].APIValue,
+		ValidatorsOnly: m.validatorsOnly,
+	}, m.redisClient)
+}
+
+// buildHeaders returns the formatted table header row with sort indicator on the active column.
+func buildHeaders(sortIndex int) string {
+	cols := []string{"UID", "STAKE (τ)", "TRUST", "EMISSION", "DIVIDND", "PERMIT"}
+	opt := network.SortOptions[sortIndex]
+	cols[opt.ColumnIndex] = lipgloss.NewStyle().
+		Foreground(taoNeon).Bold(true).
+		Render(cols[opt.ColumnIndex] + " " + arrow(opt.APIValue))
+
+	return fmt.Sprintf(" %-5s │ %-14s │ %-8s │ %-10s │ %-8s │ %s",
+		cols[0], cols[1], cols[2], cols[3], cols[4], cols[5])
+}
+
+func arrow(apiValue string) string {
+	if strings.HasSuffix(apiValue, "_asc") {
+		return "↑"
+	}
+	return "↓"
+}
+
 func (m *Model) addLog(msg string) {
-	entry := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg)
-	m.logs = append(m.logs, entry)
+	m.logs = append(m.logs, fmt.Sprintf("[%s] %s", ts(), msg))
 	if len(m.logs) > 5 {
 		m.logs = m.logs[len(m.logs)-5:]
 	}
+}
+
+func ts() string { return time.Now().Format("15:04:05") }
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 func getMockNeurons() []types.Neuron {
@@ -286,6 +394,6 @@ func getMockNeurons() []types.Neuron {
 		{UID: 14, Stake: 89040.20, Trust: 0.9120, Emission: 8.12, Dividends: 0.1832, ValidatorPermit: true},
 		{UID: 42, Stake: 45000.00, Trust: 0.8500, Emission: 4.05, Dividends: 0.0921, ValidatorPermit: true},
 		{UID: 128, Stake: 21000.75, Trust: 0.7200, Emission: 1.89, Dividends: 0.0412, ValidatorPermit: false},
-		{UID: 256, Stake: 5000.10, Trust: 0.4500, Emission: 0.20, Dividends: 0.0050, ValidatorPermit: false},
+		{UID: 255, Stake: 5000.10, Trust: 0.4500, Emission: 0.20, Dividends: 0.0050, ValidatorPermit: false},
 	}
 }

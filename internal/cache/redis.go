@@ -11,20 +11,16 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	// TTL de sécurité : nettoyage automatique si le block watcher plante.
-	// En conditions normales, l'invalidation se fait par numéro de bloc.
-	safeguardTTL = 5 * time.Minute
-)
+const safeguardTTL = 5 * time.Minute
 
 // Client wraps a Redis connection.
-// Nil-safe : toutes les méthodes vérifient si le client est nil avant d'opérer.
+// Nil-safe: all methods check for nil before operating.
 type Client struct {
 	rdb *redis.Client
 }
 
-// New crée un client Redis depuis une URL (ex: "redis://localhost:6379").
-// Retourne une erreur si la connexion échoue — l'appelant doit gérer le fallback.
+// New creates a Redis client from a URL (e.g. "redis://localhost:6379").
+// Returns an error on connection failure — caller must handle the fallback.
 func New(redisURL string) (*Client, error) {
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
@@ -43,14 +39,13 @@ func New(redisURL string) (*Client, error) {
 	return &Client{rdb: rdb}, nil
 }
 
-// GetMetagraph retourne les neurons cachés pour un subnet + numéro de bloc.
-// Retourne false si le cache est vide ou si le client est nil.
-func (c *Client) GetMetagraph(ctx context.Context, netUID, blockNumber int) ([]types.Neuron, bool) {
+// Get retrieves cached neurons by an arbitrary string key.
+// Returns false if the key is missing or the client is nil.
+func (c *Client) Get(ctx context.Context, key string) ([]types.Neuron, bool) {
 	if c == nil {
 		return nil, false
 	}
 
-	key := metagraphKey(netUID, blockNumber)
 	data, err := c.rdb.Get(ctx, key).Bytes()
 	if err != nil {
 		return nil, false
@@ -64,8 +59,8 @@ func (c *Client) GetMetagraph(ctx context.Context, netUID, blockNumber int) ([]t
 	return neurons, true
 }
 
-// SetMetagraph stocke les neurons pour un subnet + numéro de bloc avec un TTL de sécurité.
-func (c *Client) SetMetagraph(ctx context.Context, netUID, blockNumber int, neurons []types.Neuron) error {
+// Set stores neurons under an arbitrary string key with the safeguard TTL.
+func (c *Client) Set(ctx context.Context, key string, neurons []types.Neuron) error {
 	if c == nil {
 		return nil
 	}
@@ -75,17 +70,13 @@ func (c *Client) SetMetagraph(ctx context.Context, netUID, blockNumber int, neur
 		return fmt.Errorf("redis: marshal neurons: %w", err)
 	}
 
-	return c.rdb.Set(ctx, metagraphKey(netUID, blockNumber), data, safeguardTTL).Err()
+	return c.rdb.Set(ctx, key, data, safeguardTTL).Err()
 }
 
-// Delete supprime une clé de cache — utilisé par le stress test pour isoler les scénarios.
-func (c *Client) Delete(ctx context.Context, netUID, blockNumber int) error {
+// Del removes a key — used by the stress test to isolate scenarios.
+func (c *Client) Del(ctx context.Context, key string) error {
 	if c == nil {
 		return nil
 	}
-	return c.rdb.Del(ctx, metagraphKey(netUID, blockNumber)).Err()
-}
-
-func metagraphKey(netUID, blockNumber int) string {
-	return fmt.Sprintf("taodash:metagraph:%d:%d", netUID, blockNumber)
+	return c.rdb.Del(ctx, key).Err()
 }

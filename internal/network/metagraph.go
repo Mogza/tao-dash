@@ -18,10 +18,10 @@ import (
 
 // --- Configuration ---
 
-// taostatsBaseURL est une var (pas const) pour permettre l'injection d'un serveur mock dans les tests.
+// taostatsBaseURL is a var (not const) to allow mock injection in tests.
 var taostatsBaseURL = "https://api.taostats.io/api"
 
-// SetBaseURL remplace l'URL de l'API — réservé aux tests et au stress test.
+// SetBaseURL overrides the API base URL — reserved for tests and the stress test.
 func SetBaseURL(url string) { taostatsBaseURL = url }
 
 const (
@@ -29,110 +29,107 @@ const (
 	requestTimeout = 10 * time.Second
 )
 
-// sfGroup collapse les requêtes concurrentes pour le même bloc en un seul appel réel.
-// Même si 50 goroutines déclenchent FetchMetagraph pour le bloc N simultanément,
-// une seule touche l'API — les 49 autres reçoivent le résultat partagé.
+// sfGroup collapses concurrent requests for the same key into a single real call.
 var sfGroup singleflight.Group
 
-// --- Taostats API JSON shapes ---
+// --- Sort options ---
 
-type apiKey struct {
-	Hex  string `json:"hex"`
-	SS58 string `json:"ss58"`
+// SortOption describes a column sort configuration.
+type SortOption struct {
+	APIValue    string // value for the Taostats API `order` query param
+	Label       string // display label shown in the table header
+	ColumnIndex int    // which column (0-based) gets the sort indicator arrow
 }
 
-type apiNeuron struct {
-	UID              int    `json:"uid"`
-	Netuid           int    `json:"netuid"`
-	Active           bool   `json:"active"`
-	Stake            string `json:"stake"`
-	Trust            string `json:"trust"`
-	Consensus        string `json:"consensus"`
-	Incentive        string `json:"incentive"`
-	Dividends        string `json:"dividends"`
-	Emission         string `json:"emission"`
-	ValidatorPermit  bool   `json:"validator_permit"`
-	ValidatorTrust   string `json:"validator_trust"`
-	Rank             int    `json:"rank"`
-	Hotkey           apiKey `json:"hotkey"`
-	Coldkey          apiKey `json:"coldkey"`
-	BlockNumber      int    `json:"block_number"`
-	DailyReward      string `json:"daily_reward"`
-	Updated          int    `json:"updated"`
-	IsImmunityPeriod bool   `json:"is_immunity_period"`
-	AlphaStake       string `json:"alpha_stake"`
-	RootStake        string `json:"root_stake"`
-	TotalAlphaStake  string `json:"total_alpha_stake"`
+// SortOptions is the ordered list of available sorts, cycled with the [s] key.
+var SortOptions = []SortOption{
+	{"stake_desc", "STAKE ↓", 1},
+	{"emission_desc", "EMISSION ↓", 3},
+	{"trust_desc", "TRUST ↓", 2},
+	{"dividends_desc", "DIVIDND ↓", 4},
+	{"uid_asc", "UID ↑", 0},
 }
 
-type apiResponse struct {
-	Data       []apiNeuron   `json:"data"`
-	Pagination apiPagination `json:"pagination"`
+// --- Fetch options ---
+
+// FetchOptions bundles all parameters that define a unique metagraph query.
+// Changing any field produces a distinct cache key.
+type FetchOptions struct {
+	NetUID         int
+	BlockNumber    int    // 0 = skip cache, force API call
+	SortOrder      string // must match a SortOption.APIValue
+	ValidatorsOnly bool
 }
 
-type apiPagination struct {
-	CurrentPage int  `json:"current_page"`
-	NextPage    *int `json:"next_page"`
-	PerPage     int  `json:"per_page"`
-	TotalItems  int  `json:"total_items"`
-	TotalPages  int  `json:"total_pages"`
+// CacheKey returns the Redis key for a given set of fetch options.
+// Exported so the stress test can flush the right keys between scenarios.
+func CacheKey(opts FetchOptions) string {
+	v := 0
+	if opts.ValidatorsOnly {
+		v = 1
+	}
+	return fmt.Sprintf("taodash:metagraph:%d:%d:%s:%d",
+		opts.NetUID, opts.BlockNumber, opts.SortOrder, v)
 }
 
-// --- Bubbletea Messages ---
+// --- Bubbletea messages ---
 
-// MetagraphMsg transporte les données du metagraph vers le Update() de l'UI.
+// MetagraphMsg carries fetched neuron data to the UI Update().
 type MetagraphMsg struct {
 	Neurons   []types.Neuron
 	NetUID    int
 	Block     int
-	FromCache bool // true = servi depuis Redis, false = frais depuis l'API
+	FromCache bool // true = served from Redis
 }
 
-// MetagraphErrMsg transporte une erreur réseau vers les logs de l'UI.
+// MetagraphErrMsg carries a network error to the UI logs.
 type MetagraphErrMsg struct {
 	Err error
 }
 
-// --- Public API ---
+// --- Internal singleflight result ---
 
-// sfResult est le type interne partagé par singleflight.
 type sfResult struct {
 	neurons []types.Neuron
 	block   int
 }
 
-// FetchMetagraph retourne un tea.Cmd qui :
-// 1. Vérifie le cache Redis (cache hit → retour immédiat, pas de singleflight)
-// 2. Via singleflight : collapse les appels concurrents pour le même bloc en 1 seul appel API
-// 3. Stocke le résultat dans Redis
+// --- Public API ---
+
+// FetchMetagraph returns a tea.Cmd that:
+//  1. Checks Redis (cache hit → immediate return, no singleflight overhead)
+//  2. Via singleflight: collapses concurrent requests for the same key into 1 API call
+//  3. Stores the result in Redis keyed by the block number the API returns
 //
-// blockNumber = 0 → skip le check cache, force un appel API (utile au démarrage)
-func FetchMetagraph(apiKeyStr string, netUID int, blockNumber int, c *cache.Client) tea.Cmd {
+// opts.BlockNumber = 0 → skip cache, force an API call (startup, subnet switch, filter change)
+func FetchMetagraph(apiKeyStr string, opts FetchOptions, c *cache.Client) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 
-		// 1. Cache check : avant le singleflight pour éviter le verrou sur les hits
-		if c != nil && blockNumber > 0 {
-			if neurons, ok := c.GetMetagraph(ctx, netUID, blockNumber); ok {
+		// 1. Cache check — before singleflight to avoid lock overhead on hits
+		if c != nil && opts.BlockNumber > 0 {
+			if neurons, ok := c.Get(ctx, CacheKey(opts)); ok {
 				return MetagraphMsg{
 					Neurons:   neurons,
-					NetUID:    netUID,
-					Block:     blockNumber,
+					NetUID:    opts.NetUID,
+					Block:     opts.BlockNumber,
 					FromCache: true,
 				}
 			}
 		}
 
-		// 2. Singleflight : si 50 goroutines arrivent ici pour le même bloc,
-		//    une seule exécute le corps, les 49 autres attendent et reçoivent le même résultat.
-		sfKey := fmt.Sprintf("%d:%d", netUID, blockNumber)
+		// 2. Singleflight — one API call even if 50 goroutines arrive simultaneously
+		sfKey := fmt.Sprintf("%d:%d:%s:%v", opts.NetUID, opts.BlockNumber, opts.SortOrder, opts.ValidatorsOnly)
 		val, err, _ := sfGroup.Do(sfKey, func() (any, error) {
-			neurons, block, err := fetchMetagraphFromAPI(apiKeyStr, netUID)
+			neurons, block, err := fetchMetagraphFromAPI(apiKeyStr, opts)
 			if err != nil {
 				return nil, err
 			}
+			// Store with the block number returned by the API as key
 			if c != nil {
-				_ = c.SetMetagraph(ctx, netUID, block, neurons)
+				storeOpts := opts
+				storeOpts.BlockNumber = block
+				_ = c.Set(ctx, CacheKey(storeOpts), neurons)
 			}
 			return &sfResult{neurons: neurons, block: block}, nil
 		})
@@ -144,7 +141,7 @@ func FetchMetagraph(apiKeyStr string, netUID int, blockNumber int, c *cache.Clie
 		r := val.(*sfResult)
 		return MetagraphMsg{
 			Neurons:   r.neurons,
-			NetUID:    netUID,
+			NetUID:    opts.NetUID,
 			Block:     r.block,
 			FromCache: false,
 		}
@@ -153,11 +150,14 @@ func FetchMetagraph(apiKeyStr string, netUID int, blockNumber int, c *cache.Clie
 
 // --- Internal: HTTP fetch + parse ---
 
-func fetchMetagraphFromAPI(apiKeyStr string, netUID int) ([]types.Neuron, int, error) {
+func fetchMetagraphFromAPI(apiKeyStr string, opts FetchOptions) ([]types.Neuron, int, error) {
 	url := fmt.Sprintf(
-		"%s/metagraph/latest/v1?netuid=%d&order=stake_desc&limit=%d",
-		taostatsBaseURL, netUID, defaultLimit,
+		"%s/metagraph/latest/v1?netuid=%d&order=%s&limit=%d",
+		taostatsBaseURL, opts.NetUID, opts.SortOrder, defaultLimit,
 	)
+	if opts.ValidatorsOnly {
+		url += "&validator_permit=true"
+	}
 
 	client := &http.Client{Timeout: requestTimeout}
 	req, err := http.NewRequest("GET", url, nil)
@@ -219,7 +219,7 @@ func fetchMetagraphFromAPI(apiKeyStr string, netUID int) ([]types.Neuron, int, e
 	return neurons, block, nil
 }
 
-// raoToTao convertit un RAO string (1 TAO = 1e9 RAO) en TAO float64.
+// raoToTao converts a RAO string (1 TAO = 1e9 RAO) to TAO float64.
 func raoToTao(rao string) float64 {
 	val, err := strconv.ParseFloat(rao, 64)
 	if err != nil {
@@ -228,11 +228,55 @@ func raoToTao(rao string) float64 {
 	return val / 1e9
 }
 
-// parseFloat parse un string float, retourne 0 en cas d'erreur.
+// parseFloat parses a float string, returns 0 on error.
 func parseFloat(s string) float64 {
 	val, err := strconv.ParseFloat(s, 64)
 	if err != nil {
 		return 0
 	}
 	return val
+}
+
+// --- Taostats API JSON shapes ---
+
+type apiKey struct {
+	Hex  string `json:"hex"`
+	SS58 string `json:"ss58"`
+}
+
+type apiNeuron struct {
+	UID              int    `json:"uid"`
+	Netuid           int    `json:"netuid"`
+	Active           bool   `json:"active"`
+	Stake            string `json:"stake"`
+	Trust            string `json:"trust"`
+	Consensus        string `json:"consensus"`
+	Incentive        string `json:"incentive"`
+	Dividends        string `json:"dividends"`
+	Emission         string `json:"emission"`
+	ValidatorPermit  bool   `json:"validator_permit"`
+	ValidatorTrust   string `json:"validator_trust"`
+	Rank             int    `json:"rank"`
+	Hotkey           apiKey `json:"hotkey"`
+	Coldkey          apiKey `json:"coldkey"`
+	BlockNumber      int    `json:"block_number"`
+	DailyReward      string `json:"daily_reward"`
+	Updated          int    `json:"updated"`
+	IsImmunityPeriod bool   `json:"is_immunity_period"`
+	AlphaStake       string `json:"alpha_stake"`
+	RootStake        string `json:"root_stake"`
+	TotalAlphaStake  string `json:"total_alpha_stake"`
+}
+
+type apiResponse struct {
+	Data       []apiNeuron   `json:"data"`
+	Pagination apiPagination `json:"pagination"`
+}
+
+type apiPagination struct {
+	CurrentPage int  `json:"current_page"`
+	NextPage    *int `json:"next_page"`
+	PerPage     int  `json:"per_page"`
+	TotalItems  int  `json:"total_items"`
+	TotalPages  int  `json:"total_pages"`
 }
