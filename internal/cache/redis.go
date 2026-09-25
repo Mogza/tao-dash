@@ -78,6 +78,14 @@ func (c *Client) SetMetagraph(ctx context.Context, netUID, blockNumber int, neur
 	return c.rdb.Set(ctx, metagraphKey(netUID, blockNumber), data, safeguardTTL).Err()
 }
 
+// Delete supprime une clé de cache — utilisé par le stress test pour isoler les scénarios.
+func (c *Client) Delete(ctx context.Context, netUID, blockNumber int) error {
+	if c == nil {
+		return nil
+	}
+	return c.rdb.Del(ctx, metagraphKey(netUID, blockNumber)).Err()
+}
+
 func metagraphKey(netUID, blockNumber int) string {
 	return fmt.Sprintf("taodash:metagraph:%d:%d", netUID, blockNumber)
 }

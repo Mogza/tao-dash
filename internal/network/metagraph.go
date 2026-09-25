@@ -13,15 +13,26 @@ import (
 	"Mogza/TaoDash/internal/types"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/sync/singleflight"
 )
 
 // --- Configuration ---
 
+// taostatsBaseURL est une var (pas const) pour permettre l'injection d'un serveur mock dans les tests.
+var taostatsBaseURL = "https://api.taostats.io/api"
+
+// SetBaseURL remplace l'URL de l'API — réservé aux tests et au stress test.
+func SetBaseURL(url string) { taostatsBaseURL = url }
+
 const (
-	taostatsBaseURL = "https://api.taostats.io/api"
-	defaultLimit    = 256
-	requestTimeout  = 10 * time.Second
+	defaultLimit   = 256
+	requestTimeout = 10 * time.Second
 )
+
+// sfGroup collapse les requêtes concurrentes pour le même bloc en un seul appel réel.
+// Même si 50 goroutines déclenchent FetchMetagraph pour le bloc N simultanément,
+// une seule touche l'API — les 49 autres reçoivent le résultat partagé.
+var sfGroup singleflight.Group
 
 // --- Taostats API JSON shapes ---
 
@@ -84,17 +95,23 @@ type MetagraphErrMsg struct {
 
 // --- Public API ---
 
+// sfResult est le type interne partagé par singleflight.
+type sfResult struct {
+	neurons []types.Neuron
+	block   int
+}
+
 // FetchMetagraph retourne un tea.Cmd qui :
-// 1. Vérifie le cache Redis si disponible (clé = netuid + blockNumber)
-// 2. En cas de miss, tape l'API Taostats
-// 3. Stocke le résultat dans Redis avec une TTL de sécurité
+// 1. Vérifie le cache Redis (cache hit → retour immédiat, pas de singleflight)
+// 2. Via singleflight : collapse les appels concurrents pour le même bloc en 1 seul appel API
+// 3. Stocke le résultat dans Redis
 //
 // blockNumber = 0 → skip le check cache, force un appel API (utile au démarrage)
 func FetchMetagraph(apiKeyStr string, netUID int, blockNumber int, c *cache.Client) tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
 
-		// Cache check : seulement si on connaît le numéro de bloc courant
+		// 1. Cache check : avant le singleflight pour éviter le verrou sur les hits
 		if c != nil && blockNumber > 0 {
 			if neurons, ok := c.GetMetagraph(ctx, netUID, blockNumber); ok {
 				return MetagraphMsg{
@@ -106,21 +123,29 @@ func FetchMetagraph(apiKeyStr string, netUID int, blockNumber int, c *cache.Clie
 			}
 		}
 
-		// Cache miss ou pas de cache : appel API
-		neurons, block, err := fetchMetagraphFromAPI(apiKeyStr, netUID)
+		// 2. Singleflight : si 50 goroutines arrivent ici pour le même bloc,
+		//    une seule exécute le corps, les 49 autres attendent et reçoivent le même résultat.
+		sfKey := fmt.Sprintf("%d:%d", netUID, blockNumber)
+		val, err, _ := sfGroup.Do(sfKey, func() (any, error) {
+			neurons, block, err := fetchMetagraphFromAPI(apiKeyStr, netUID)
+			if err != nil {
+				return nil, err
+			}
+			if c != nil {
+				_ = c.SetMetagraph(ctx, netUID, block, neurons)
+			}
+			return &sfResult{neurons: neurons, block: block}, nil
+		})
+
 		if err != nil {
 			return MetagraphErrMsg{Err: err}
 		}
 
-		// Stockage dans Redis (keyed par le bloc retourné par l'API, pas par blockNumber)
-		if c != nil {
-			_ = c.SetMetagraph(ctx, netUID, block, neurons)
-		}
-
+		r := val.(*sfResult)
 		return MetagraphMsg{
-			Neurons:   neurons,
+			Neurons:   r.neurons,
 			NetUID:    netUID,
-			Block:     block,
+			Block:     r.block,
 			FromCache: false,
 		}
 	}
