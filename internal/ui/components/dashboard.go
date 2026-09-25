@@ -302,8 +302,13 @@ func (m Model) View() string {
 			prefix = "▶"
 		}
 
-		row := fmt.Sprintf("%s%-4d │ %-8s │ %-14.2f │ %-8.4f │ %-10.4f │ %-8.4f │ %s",
-			prefix, n.UID, truncate(n.HotkeySS58, 8), n.Stake, n.Trust, n.Emission, n.Dividends, permit)
+		conStr := fmt.Sprintf("%-8.4f", n.Consensus)
+		if n.ValidatorPermit && n.Consensus == 0 {
+			conStr = "VAL     "
+		}
+
+		row := fmt.Sprintf("%s%-4d │ %-8s │ %-14.2f │ %-8s │ %-10.4f │ %-8.4f │ %s",
+			prefix, n.UID, truncate(n.HotkeySS58, 8), n.Stake, conStr, n.Emission, n.Dividends, permit)
 
 		switch {
 		case m.cfg.MyHotkey != "" && n.HotkeySS58 == m.cfg.MyHotkey:
@@ -380,13 +385,13 @@ func (m Model) fetchCmd(blockNumber int) tea.Cmd {
 
 // buildHeaders returns the formatted table header row with sort indicator on the active column.
 func buildHeaders(sortIndex int) string {
-	cols := []string{"UID", "HOTKEY", "STAKE (τ)", "TRUST", "EMISSION", "DIVIDND", "PERMIT"}
+	cols := []string{"UID", "HOTKEY", "STAKE (τ)", "CONSENSUS", "EMISSION", "DIVIDND", "PERMIT"}
 	opt := network.SortOptions[sortIndex]
 	cols[opt.ColumnIndex] = lipgloss.NewStyle().
 		Foreground(taoNeon).Bold(true).
 		Render(cols[opt.ColumnIndex] + " " + arrow(opt.APIValue))
 
-	return fmt.Sprintf(" %-5s │ %-8s │ %-14s │ %-8s │ %-10s │ %-8s │ %s",
+	return fmt.Sprintf(" %-5s │ %-8s │ %-14s │ %-9s │ %-10s │ %-8s │ %s",
 		cols[0], cols[1], cols[2], cols[3], cols[4], cols[5], cols[6])
 }
 

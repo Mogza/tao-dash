@@ -45,7 +45,7 @@ type SortOption struct {
 var SortOptions = []SortOption{
 	{"stake_desc", "STAKE ↓", 2},
 	{"emission_desc", "EMISSION ↓", 4},
-	{"trust_desc", "TRUST ↓", 3},
+	{"consensus_desc", "CONSENSUS ↓", 3},
 	{"dividends_desc", "DIVIDND ↓", 5},
 	{"uid_asc", "UID ↑", 0},
 }
