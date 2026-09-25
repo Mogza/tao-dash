@@ -107,7 +107,7 @@ func scenario1(apiHits *atomic.Int64, c *cache.Client) {
 			t0 := time.Now()
 			cmd := network.FetchMetagraph("mock-key", network.FetchOptions{
 				NetUID: testNetUID, BlockNumber: testBlockNumber,
-				SortOrder: "stake_desc", ValidatorsOnly: false,
+				SortOrder: "stake_desc", Filter:      network.FilterAll,
 			}, c)
 			cmd()
 			latencies[idx] = time.Since(t0)
@@ -186,7 +186,7 @@ func scenario2(apiHits *atomic.Int64, c *cache.Client) {
 				t0 := time.Now()
 				cmd := network.FetchMetagraph("mock-key", network.FetchOptions{
 					NetUID: testNetUID, BlockNumber: blockNum,
-					SortOrder: "stake_desc", ValidatorsOnly: false,
+					SortOrder: "stake_desc", Filter:      network.FilterAll,
 				}, c)
 				cmd()
 				latencies[idx] = time.Since(t0)
@@ -358,7 +358,7 @@ func flushTestKeys(c *cache.Client) {
 	for i := 0; i <= multiBlockCount+1; i++ {
 		key := network.CacheKey(network.FetchOptions{
 			NetUID: testNetUID, BlockNumber: testBlockNumber + i,
-			SortOrder: "stake_desc", ValidatorsOnly: false,
+			SortOrder: "stake_desc", Filter:      network.FilterAll,
 		})
 		_ = c.Del(ctx, key)
 	}

@@ -54,22 +54,26 @@ var SortOptions = []SortOption{
 
 // FetchOptions bundles all parameters that define a unique metagraph query.
 // Changing any field produces a distinct cache key.
+type FilterMode string
+
+const (
+	FilterAll        FilterMode = "ALL"
+	FilterValidators FilterMode = "VALIDATORS"
+	FilterMiners     FilterMode = "MINERS"
+)
+
 type FetchOptions struct {
-	NetUID         int
-	BlockNumber    int    // 0 = skip cache, force API call
-	SortOrder      string // must match a SortOption.APIValue
-	ValidatorsOnly bool
+	NetUID      int
+	BlockNumber int    // 0 = skip cache, force API call
+	SortOrder   string // must match a SortOption.APIValue
+	Filter      FilterMode
 }
 
 // CacheKey returns the Redis key for a given set of fetch options.
 // Exported so the stress test can flush the right keys between scenarios.
 func CacheKey(opts FetchOptions) string {
-	v := 0
-	if opts.ValidatorsOnly {
-		v = 1
-	}
-	return fmt.Sprintf("taodash:metagraph:%d:%d:%s:%d",
-		opts.NetUID, opts.BlockNumber, opts.SortOrder, v)
+	return fmt.Sprintf("taodash:metagraph:%d:%d:%s:%s",
+		opts.NetUID, opts.BlockNumber, opts.SortOrder, opts.Filter)
 }
 
 // --- Bubbletea messages ---
@@ -119,7 +123,7 @@ func FetchMetagraph(apiKeyStr string, opts FetchOptions, c *cache.Client) tea.Cm
 		}
 
 		// 2. Singleflight — one API call even if 50 goroutines arrive simultaneously
-		sfKey := fmt.Sprintf("%d:%d:%s:%v", opts.NetUID, opts.BlockNumber, opts.SortOrder, opts.ValidatorsOnly)
+		sfKey := fmt.Sprintf("%d:%d:%s:%s", opts.NetUID, opts.BlockNumber, opts.SortOrder, opts.Filter)
 		val, err, _ := sfGroup.Do(sfKey, func() (any, error) {
 			neurons, block, err := fetchMetagraphFromAPI(apiKeyStr, opts)
 			if err != nil {
@@ -151,13 +155,17 @@ func FetchMetagraph(apiKeyStr string, opts FetchOptions, c *cache.Client) tea.Cm
 // --- Internal: HTTP fetch + parse ---
 
 func fetchMetagraphFromAPI(apiKeyStr string, opts FetchOptions) ([]types.Neuron, int, error) {
-	url := fmt.Sprintf(
-		"%s/metagraph/latest/v1?netuid=%d&order=%s&limit=%d",
-		taostatsBaseURL, opts.NetUID, opts.SortOrder, defaultLimit,
-	)
-	if opts.ValidatorsOnly {
-		url += "&validator_permit=true"
+	validatorsParam := ""
+	if opts.Filter == FilterValidators {
+		validatorsParam = "&validator_permit=true"
+	} else if opts.Filter == FilterMiners {
+		validatorsParam = "&validator_permit=false"
 	}
+
+	url := fmt.Sprintf(
+		"%s/metagraph/latest/v1?netuid=%d&order=%s&limit=%d%s",
+		taostatsBaseURL, opts.NetUID, opts.SortOrder, defaultLimit, validatorsParam,
+	)
 
 	client := &http.Client{Timeout: requestTimeout}
 	req, err := http.NewRequest("GET", url, nil)

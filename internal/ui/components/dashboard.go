@@ -59,7 +59,7 @@ type Model struct {
 	loading        bool
 	netUID         int
 	sortIndex      int  // index into network.SortOptions
-	validatorsOnly  bool // filter: show only neurons with validator_permit=true
+	filterMode      network.FilterMode
 	blockSub        network.BlockSub
 	redisClient     *cache.Client
 	lastCached      bool
@@ -87,7 +87,7 @@ func InitialModel() Model {
 		loading:        true,
 		netUID:         cfg.DefaultNetUID,
 		sortIndex:      0, // default: stake_desc
-		validatorsOnly: false,
+		filterMode:     network.FilterAll,
 		blockSub:       network.NewBlockSub(),
 		redisClient:    redisClient,
 	}
@@ -163,14 +163,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Toggle validator filter
 		case "v":
-			m.validatorsOnly = !m.validatorsOnly
+			switch m.filterMode {
+			case network.FilterAll:
+				m.filterMode = network.FilterValidators
+			case network.FilterValidators:
+				m.filterMode = network.FilterMiners
+			case network.FilterMiners:
+				m.filterMode = network.FilterAll
+			}
 			m.loading = true
 			m.cursor = 0
-			filter := "ALL"
-			if m.validatorsOnly {
-				filter = "VALIDATORS"
-			}
-			m.addLog(fmt.Sprintf("Filter: %s", filter))
+			m.addLog(fmt.Sprintf("Filter: %s", m.filterMode))
 			return m, m.debounceCmd()
 
 		// Force refresh (bypasses cache)
@@ -260,8 +263,10 @@ func (m Model) View() string {
 		labelStyle.Render("NEURONS:"), metricStyle.Render(fmt.Sprintf("%d", len(m.neurons))))
 
 	filterStr := labelStyle.Render("ALL")
-	if m.validatorsOnly {
+	if m.filterMode == network.FilterValidators {
 		filterStr = lipgloss.NewStyle().Foreground(cyan).Render("VALIDATORS")
+	} else if m.filterMode == network.FilterMiners {
+		filterStr = lipgloss.NewStyle().Foreground(cyan).Render("MINERS")
 	}
 
 	headerInfo := lipgloss.JoinHorizontal(lipgloss.Center,
@@ -366,10 +371,10 @@ func (m Model) fetchCmd(blockNumber int) tea.Cmd {
 		}
 	}
 	return network.FetchMetagraph(m.cfg.TaostatsAPIKey, network.FetchOptions{
-		NetUID:         m.netUID,
-		BlockNumber:    blockNumber,
-		SortOrder:      network.SortOptions[m.sortIndex].APIValue,
-		ValidatorsOnly: m.validatorsOnly,
+		NetUID:      m.netUID,
+		BlockNumber: blockNumber,
+		SortOrder:   network.SortOptions[m.sortIndex].APIValue,
+		Filter:      m.filterMode,
 	}, m.redisClient)
 }
 
