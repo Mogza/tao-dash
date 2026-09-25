@@ -59,10 +59,11 @@ type Model struct {
 	loading        bool
 	netUID         int
 	sortIndex      int  // index into network.SortOptions
-	validatorsOnly bool // filter: show only neurons with validator_permit=true
-	blockSub       network.BlockSub
-	redisClient    *cache.Client
-	lastCached     bool
+	validatorsOnly  bool // filter: show only neurons with validator_permit=true
+	blockSub        network.BlockSub
+	redisClient     *cache.Client
+	lastCached      bool
+	fetchDebounceID int // used to debounce rapid key presses
 }
 
 func InitialModel() Model {
@@ -140,7 +141,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 				m.loading = true
 				m.addLog(fmt.Sprintf("Switching to Subnet %d...", m.netUID))
-				return m, m.fetchCmd(0)
+				return m, m.debounceCmd()
 			}
 
 		case "]", "right":
@@ -149,7 +150,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 				m.loading = true
 				m.addLog(fmt.Sprintf("Switching to Subnet %d...", m.netUID))
-				return m, m.fetchCmd(0)
+				return m, m.debounceCmd()
 			}
 
 		// Cycle sort order
@@ -158,7 +159,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			m.cursor = 0
 			m.addLog(fmt.Sprintf("Sort: %s", network.SortOptions[m.sortIndex].Label))
-			return m, m.fetchCmd(0)
+			return m, m.debounceCmd()
 
 		// Toggle validator filter
 		case "v":
@@ -170,7 +171,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				filter = "VALIDATORS"
 			}
 			m.addLog(fmt.Sprintf("Filter: %s", filter))
-			return m, m.fetchCmd(0)
+			return m, m.debounceCmd()
 
 		// Force refresh (bypasses cache)
 		case "r":
@@ -191,6 +192,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			network.WaitForBlock(m.blockSub), // re-queue to keep listening
 			m.fetchCmd(msg.Number),           // fetch with block hint for cache lookup
 		)
+
+	// Debounce timer fired
+	case DebounceMsg:
+		if msg.ID == m.fetchDebounceID {
+			return m, m.fetchCmd(0) // actual fetch only if this was the last keypress
+		}
 
 	// Block watcher error (logged, no crash)
 	case network.BlockWatchErrMsg:
@@ -334,6 +341,19 @@ func (m Model) View() string {
 }
 
 // --- Helpers ---
+
+// DebounceMsg is sent after a short delay following a keypress to prevent API spam.
+type DebounceMsg struct {
+	ID int
+}
+
+func (m *Model) debounceCmd() tea.Cmd {
+	m.fetchDebounceID++
+	id := m.fetchDebounceID
+	return tea.Tick(300*time.Millisecond, func(_ time.Time) tea.Msg {
+		return DebounceMsg{ID: id}
+	})
+}
 
 // fetchCmd builds a FetchMetagraph tea.Cmd from current model state.
 // blockNumber = 0 forces an API call (skips cache) — used on subnet switch, sort change, etc.
