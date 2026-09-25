@@ -46,7 +46,7 @@ var (
 
 const (
 	minNetUID = 1
-	maxNetUID = 64
+	maxNetUID = 256 // Bittensor's subnet limit expanded beyond 64 with Dynamic Subnets
 	maxRows   = 15
 )
 
