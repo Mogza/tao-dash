@@ -21,19 +21,36 @@ This is not a synchronous script. It is built for high concurrency and low laten
 
 ## Getting Started
 
+### 1. Start Redis
+TAO-DASH relies on Redis for high-performance caching. You can run it via Docker or natively:
+```bash
+# Using Docker
+docker run -d -p 6379:6379 redis:alpine
+
+# OR natively
+redis-server --daemonize yes
+```
+
+### 2. Configure and Run
 ```bash
 git clone https://github.com/Mogza/tao-dash
 cd tao-dash
 
 # Configure your API key (free tier at https://taostats.io/pro)
 cp .env.example .env
-# Edit .env: set TAOSTATS_API_KEY and optionally REDIS_URL
+# Edit .env: set TAOSTATS_API_KEY, REDIS_URL, and optionally MY_HOTKEY
 
 go mod tidy
 go run ./cmd/tao-dash/
 ```
 
-**Controls:** `↑/k` Up · `↓/j` Down · `r` Force Refresh · `q` Quit
+**Controls:**
+- `[` / `]` — Switch Subnet (1-64)
+- `s` — Cycle Sort Order (Stake, Emission, Trust, Dividends, UID)
+- `v` — Toggle Filter (All / Validators Only)
+- `↑/k` `↓/j` — Scroll Table
+- `r` — Force Refresh
+- `q` — Quit
 
 ## Milestones & Roadmap
 
@@ -41,7 +58,7 @@ go run ./cmd/tao-dash/
 - [x] **Sprint 2** — Live Block Height (absorbed into Sprint 3 via metagraph response)
 - [x] **Sprint 3** — Metagraph Ingestion (live Validator/Miner stats: UID, Stake, Trust, Emission)
 - [x] **Sprint 4** — State Management & Caching (Redis + Singleflight + event-driven WebSocket)
-- [ ] **Sprint 5** — Dynamic Navigation (Subnet selection, sorting by yield/stake)
+- [x] **Sprint 5** — Dynamic Navigation (Subnet selection, sorting, filtering, hotkey tracking)
 
 ---
 
