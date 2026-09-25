@@ -2,6 +2,8 @@ package config
 
 import (
 	"os"
+
+	"github.com/joho/godotenv"
 )
 
 // Config holds the application configuration.
@@ -10,15 +12,16 @@ type Config struct {
 	DefaultNetUID  int
 }
 
-// Load reads configuration from environment variables.
-// TAOSTATS_API_KEY is required for metagraph data.
-// TAO_DASH_NETUID defaults to 1 (Subnet 1).
+// Load reads configuration from a .env file (if present) then from environment variables.
+// Environment variables set in the shell take precedence over the .env file.
+// TAOSTATS_API_KEY is required for live metagraph data.
 func Load() Config {
-	netUID := 1
+	// Silently ignore if .env is absent — not an error in production.
+	_ = godotenv.Load()
 
 	return Config{
 		TaostatsAPIKey: os.Getenv("TAOSTATS_API_KEY"),
-		DefaultNetUID:  netUID,
+		DefaultNetUID:  1,
 	}
 }
 
